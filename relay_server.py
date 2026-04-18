@@ -7,17 +7,23 @@ from collections import defaultdict
 
 rooms = defaultdict(list)
 
-# Health Check для Render
-async def process_request(path, headers):
-    if path in ("/healthz", "/"):
-        return http.HTTPStatus.OK, [], b"OK\n"
-    return None  # продолжить как WebSocket
+# ✅ Улучшенный Health Check для Render
+async def process_request(path, request_headers):
+    if path in ("/", "/healthz", "/health"):
+        response_headers = [("Content-Type", "text/plain")]
+        return http.HTTPStatus.OK, response_headers, b"OK\n"
+    # Если это не health check — продолжаем как WebSocket
+    return None
 
 async def handler(websocket):
     game_id = None
     try:
         async for message in websocket:
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except:
+                continue
+
             action = data.get("action")
             game_id = data.get("game_id")
 
@@ -28,7 +34,7 @@ async def handler(websocket):
             if action == "join":
                 rooms[game_id].append(websocket)
                 count = len(rooms[game_id])
-                await broadcast(game_id, {"action": "player_joined", "players": count})
+                await broadcast(game_id, {"action": "player_joined", "players": count, "message": f"Игрок подключился. Всего: {count}"})
 
             elif action == "move":
                 await broadcast(game_id, data, exclude=websocket)
@@ -37,20 +43,20 @@ async def handler(websocket):
                 await broadcast(game_id, data)
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Handler error: {e}")
     finally:
         if game_id and websocket in rooms.get(game_id, []):
             rooms[game_id].remove(websocket)
-            if not rooms[game_id]:
-                del rooms[game_id]
-            else:
+            if rooms[game_id]:
                 await broadcast(game_id, {"action": "player_left"})
+            else:
+                del rooms[game_id]
 
 async def broadcast(game_id, message, exclude=None):
     if game_id not in rooms:
         return
     msg = json.dumps(message) if isinstance(message, dict) else str(message)
-    for client in rooms[game_id][:]:
+    for client in list(rooms[game_id]):
         if client != exclude and client.open:
             try:
                 await client.send(msg)
@@ -63,9 +69,12 @@ async def main():
         handler,
         "0.0.0.0",
         port,
-        process_request=process_request   # ← это важно
+        process_request=process_request,
+        ping_interval=20,      # держит соединение живым
+        ping_timeout=30
     ):
-        print(f"✅ Relay сервер запущен на порту {port} | Health check готов")
+        print(f"✅ Relay сервер успешно запущен на порту {port}")
+        print("Health check /healthz настроен")
         await asyncio.Future()
 
 if __name__ == "__main__":
