@@ -2,15 +2,16 @@ import asyncio
 import websockets
 import json
 import os
+import http
 from collections import defaultdict
 
 rooms = defaultdict(list)
 
-# === Health Check для Render ===
-async def health_check(path, headers):
-    if path == "/healthz" or path == "/":
-        return websockets.http.HTTPStatus.OK, [], b"OK\n"
-    return None  # None = продолжить как обычный WebSocket
+# Health Check для Render
+async def process_request(path, headers):
+    if path in ("/healthz", "/"):
+        return http.HTTPStatus.OK, [], b"OK\n"
+    return None  # продолжить как WebSocket
 
 async def handler(websocket):
     game_id = None
@@ -26,13 +27,8 @@ async def handler(websocket):
 
             if action == "join":
                 rooms[game_id].append(websocket)
-                player_count = len(rooms[game_id])
-                await broadcast(game_id, {
-                    "action": "player_joined",
-                    "players": player_count,
-                    "message": f"Player joined. Total: {player_count}"
-                })
-                print(f"Player joined game {game_id} | Total: {player_count}")
+                count = len(rooms[game_id])
+                await broadcast(game_id, {"action": "player_joined", "players": count})
 
             elif action == "move":
                 await broadcast(game_id, data, exclude=websocket)
@@ -53,27 +49,24 @@ async def handler(websocket):
 async def broadcast(game_id, message, exclude=None):
     if game_id not in rooms:
         return
-    msg_str = json.dumps(message) if isinstance(message, dict) else str(message)
+    msg = json.dumps(message) if isinstance(message, dict) else str(message)
     for client in rooms[game_id][:]:
         if client != exclude and client.open:
             try:
-                await client.send(msg_str)
+                await client.send(msg)
             except:
                 pass
 
 async def main():
-    port = int(os.environ.get("PORT", 7778))
+    port = int(os.environ.get("PORT", 10000))
     async with websockets.serve(
         handler,
         "0.0.0.0",
         port,
-        process_request=health_check   # ← вот это главное добавление
+        process_request=process_request   # ← это важно
     ):
-        print(f"Relay сервер запущен на порту {port} (Render ready)")
+        print(f"✅ Relay сервер запущен на порту {port} | Health check готов")
         await asyncio.Future()
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
