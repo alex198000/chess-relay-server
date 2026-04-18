@@ -4,8 +4,13 @@ import json
 import os
 from collections import defaultdict
 
-# Хранилище комнат: game_id -> список websocket-клиентов
 rooms = defaultdict(list)
+
+# === Health Check для Render ===
+async def health_check(path, headers):
+    if path == "/healthz" or path == "/":
+        return websockets.http.HTTPStatus.OK, [], b"OK\n"
+    return None  # None = продолжить как обычный WebSocket
 
 async def handler(websocket):
     game_id = None
@@ -58,9 +63,17 @@ async def broadcast(game_id, message, exclude=None):
 
 async def main():
     port = int(os.environ.get("PORT", 7778))
-    async with websockets.serve(handler, "0.0.0.0", port):
-        print(f"Relay сервер запущен на порту {port}")
+    async with websockets.serve(
+        handler,
+        "0.0.0.0",
+        port,
+        process_request=health_check   # ← вот это главное добавление
+    ):
+        print(f"Relay сервер запущен на порту {port} (Render ready)")
         await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__ == "__main__":
     asyncio.run(main())
