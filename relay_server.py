@@ -5,76 +5,135 @@ import os
 import http
 from collections import defaultdict
 
-rooms = defaultdict(list)
+# room_id -> set of websockets
+rooms = defaultdict(set)
 
-# ✅ Улучшенный Health Check для Render
+# websocket -> room_id
+user_room = {}
+
+# websocket -> game_id (фиксируем один раз)
+user_game = {}
+
+# ================= HEALTH CHECK =================
 async def process_request(path, request_headers):
     if path in ("/", "/healthz", "/health"):
-        response_headers = [("Content-Type", "text/plain")]
-        return http.HTTPStatus.OK, response_headers, b"OK\n"
-    # Если это не health check — продолжаем как WebSocket
+        return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK\n"
     return None
 
-async def handler(websocket):
-    game_id = None
-    try:
-        async for message in websocket:
-            try:
-                data = json.loads(message)
-            except:
-                continue
-
-            action = data.get("action")
-            game_id = data.get("game_id")
-
-            if not game_id:
-                await websocket.send(json.dumps({"error": "game_id is required"}))
-                continue
-
-            if action == "join":
-                rooms[game_id].append(websocket)
-                count = len(rooms[game_id])
-                await broadcast(game_id, {"action": "player_joined", "players": count, "message": f"Игрок подключился. Всего: {count}"})
-
-            elif action == "move":
-                await broadcast(game_id, data, exclude=websocket)
-
-            elif action == "chat":
-                await broadcast(game_id, data)
-
-    except Exception as e:
-        print(f"Handler error: {e}")
-    finally:
-        if game_id and websocket in rooms.get(game_id, []):
-            rooms[game_id].remove(websocket)
-            if rooms[game_id]:
-                await broadcast(game_id, {"action": "player_left"})
-            else:
-                del rooms[game_id]
-
+# ================= BROADCAST =================
 async def broadcast(game_id, message, exclude=None):
     if game_id not in rooms:
         return
-    msg = json.dumps(message) if isinstance(message, dict) else str(message)
+
+    msg = json.dumps(message, ensure_ascii=False)
+
     for client in list(rooms[game_id]):
-        if client != exclude and client.open:
+        if client != exclude:
             try:
                 await client.send(msg)
             except:
                 pass
 
+# ================= HANDLER =================
+async def handler(websocket):
+    game_id = None
+
+    try:
+        async for message in websocket:
+
+            try:
+                data = json.loads(message)
+            except:
+                continue
+
+            # 🔥 FIX: поддержка Unity формата
+            action = data.get("action")
+            game_id = data.get("game_id") or data.get("gameId")
+
+            if not action:
+                continue
+
+            # ================= JOIN =================
+            if action == "join":
+
+                if not game_id:
+                    await websocket.send(json.dumps({"error": "game_id required"}))
+                    continue
+
+                game_id = game_id.upper()
+
+                rooms[game_id].add(websocket)
+                user_room[websocket] = game_id
+                user_game[websocket] = game_id
+
+                count = len(rooms[game_id])
+
+                await broadcast(game_id, {
+                    "action": "player_joined",
+                    "players": count,
+                    "game_id": game_id,
+                    "message": f"Игрок подключился. Всего: {count}"
+                })
+
+            # ================= MOVE =================
+            elif action == "move":
+
+                game_id = user_room.get(websocket)
+
+                if not game_id:
+                    continue
+
+                await broadcast(game_id, {
+                    "action": "move",
+                    "data": data
+                }, exclude=websocket)
+
+            # ================= CHAT =================
+            elif action == "chat":
+
+                game_id = user_room.get(websocket)
+
+                if not game_id:
+                    continue
+
+                await broadcast(game_id, {
+                    "action": "chat",
+                    "data": data
+                })
+
+    except Exception as e:
+        print("Handler error:", e)
+
+    finally:
+        # ================= CLEANUP =================
+        game_id = user_room.get(websocket)
+
+        if game_id and websocket in rooms[game_id]:
+            rooms[game_id].remove(websocket)
+
+            if len(rooms[game_id]) > 0:
+                await broadcast(game_id, {
+                    "action": "player_left"
+                })
+            else:
+                del rooms[game_id]
+
+        user_room.pop(websocket, None)
+        user_game.pop(websocket, None)
+
+# ================= MAIN =================
 async def main():
     port = int(os.environ.get("PORT", 10000))
+
     async with websockets.serve(
         handler,
         "0.0.0.0",
         port,
         process_request=process_request,
-        ping_interval=20,      # держит соединение живым
+        ping_interval=20,
         ping_timeout=30
     ):
-        print(f"✅ Relay сервер успешно запущен на порту {port}")
-        print("Health check /healthz настроен")
+        print(f"✅ Server running on port {port}")
         await asyncio.Future()
 
 if __name__ == "__main__":
