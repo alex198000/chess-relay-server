@@ -1,91 +1,174 @@
+import argparse
 import asyncio
-import websockets
 import json
 import os
-import http
-from collections import defaultdict
+from typing import Any
 
-rooms = defaultdict(list)
+from aiohttp import WSMsgType, web
 
-# 🔥 ВАЖНО: игнор HTTP запросов (Render health check fix)
-async def process_request(path, request_headers):
-    if path in ("/", "/healthz", "/health"):
-        return http.HTTPStatus.OK, [("Content-Type", "text/plain")], b"OK\n"
-    return None  # WebSocket only
+rooms: dict[str, dict[str, web.WebSocketResponse | None]] = {}
 
-async def handler(websocket):
-    game_id = None
+
+def get_peer(room_id: str, ws: web.WebSocketResponse) -> web.WebSocketResponse | None:
+    room = rooms.get(room_id)
+    if not room:
+        return None
+    if room.get("host") is ws:
+        return room.get("guest")
+    if room.get("guest") is ws:
+        return room.get("host")
+    return None
+
+
+async def send_json(ws: web.WebSocketResponse, payload: dict[str, Any]) -> None:
+    await ws.send_str(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+
+
+async def relay_socket(ws: web.WebSocketResponse) -> None:
+    room_id: str | None = None
     try:
-        async for message in websocket:
-
-            # 🔥 защита от мусора
-            if not isinstance(message, str):
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT:
+                raw = msg.data
+            elif msg.type == WSMsgType.BINARY:
+                raw = msg.data.decode("utf-8", errors="replace")
+            elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                break
+            else:
                 continue
 
             try:
-                data = json.loads(message)
-            except:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
                 continue
 
-            action = data.get("action")
-            game_id = data.get("game_id")
+            action = str(data.get("action") or "").strip().lower()
+            gid = data.get("game_id") or data.get("gameId")
+            gid = gid.strip().upper() if isinstance(gid, str) else None
 
-            if not game_id:
-                await websocket.send(json.dumps({"error": "game_id required"}))
+            if action in ("join", "register", "connect", "enter", "handshake") and gid:
+                room_id = gid
+                room = rooms.setdefault(room_id, {"host": None, "guest": None})
+                is_host = bool(data.get("host"))
+                slot = "host" if is_host else "guest"
+
+                old = room.get(slot)
+                if old is not None and old is not ws:
+                    try:
+                        await old.close()
+                    except Exception:
+                        pass
+
+                room[slot] = ws
+
+                await send_json(
+                    ws,
+                    {
+                        "action": "player_joined",
+                        "game_id": room_id,
+                        "message": f"Room {room_id} - {'host' if is_host else 'guest'} joined.",
+                    },
+                )
+                peer = get_peer(room_id, ws)
+                if peer is not None and not peer.closed:
+                    name = data.get("sender") or "Player"
+                    await send_json(
+                        peer,
+                        {
+                            "action": "player_joined",
+                            "game_id": room_id,
+                            "message": f"Opponent ({name}) joined.",
+                        },
+                    )
                 continue
 
-            # JOIN
-            if action == "join":
-                if websocket not in rooms[game_id]:
-                    rooms[game_id].append(websocket)
+            if room_id is None:
+                await send_json(
+                    ws, {"error": "Send a Join message with game_id and host first."}
+                )
+                continue
 
-                await broadcast(game_id, {
-                    "action": "player_joined",
-                    "count": len(rooms[game_id])
-                })
+            if gid and gid != room_id:
+                room_id = gid
 
-            # MOVE
-            elif action == "move":
-                await broadcast(game_id, data, exclude=websocket)
+            peer = get_peer(room_id, ws)
+            if peer is None or peer.closed:
+                await send_json(
+                    ws,
+                    {
+                        "action": "status",
+                        "game_id": room_id,
+                        "message": "Waiting for opponent in this room...",
+                    },
+                )
+                continue
 
-            # CHAT
-            elif action == "chat":
-                await broadcast(game_id, data)
-
-    except Exception as e:
-        print("Handler error:", e)
-
-    finally:
-        if game_id and websocket in rooms.get(game_id, []):
-            rooms[game_id].remove(websocket)
-            await broadcast(game_id, {"action": "player_left"})
-
-async def broadcast(game_id, message, exclude=None):
-    if game_id not in rooms:
-        return
-
-    msg = json.dumps(message)
-
-    for client in list(rooms[game_id]):
-        if client != exclude:
             try:
-                await client.send(msg)
-            except:
+                await peer.send_str(raw)
+            except Exception:
                 pass
 
-async def main():
-    port = int(os.environ.get("PORT", 10000))
+    finally:
+        if room_id and room_id in rooms:
+            room = rooms[room_id]
+            for key in ("host", "guest"):
+                if room.get(key) is ws:
+                    room[key] = None
 
-    async with websockets.serve(
-        handler,
-        "0.0.0.0",
-        port,
-        process_request=process_request,
-        ping_interval=25,
-        ping_timeout=60
-    ):
-        print("Server started")
-        await asyncio.Future()
+            peer = get_peer(room_id, ws)
+            if peer is not None and not peer.closed:
+                try:
+                    await send_json(
+                        peer,
+                        {
+                            "action": "player_joined",
+                            "game_id": room_id,
+                            "message": "Opponent disconnected.",
+                        },
+                    )
+                except Exception:
+                    pass
+
+            if room.get("host") is None and room.get("guest") is None:
+                rooms.pop(room_id, None)
+
+
+async def http_or_ws(request: web.Request) -> web.StreamResponse:
+    path = request.path.split("?")[0]
+    if path not in ("/", "/healthz", "/health"):
+        raise web.HTTPNotFound()
+
+    # Handle Render / load-balancer plain HTTP probes.
+    if request.headers.get("Upgrade", "").lower() != "websocket":
+        if request.method == "HEAD":
+            return web.Response(status=200, body=b"")
+        if request.method == "GET":
+            return web.Response(text="OK\n")
+        raise web.HTTPMethodNotAllowed(request.method, ("GET", "HEAD"))
+
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    await relay_socket(ws)
+    return ws
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default=os.environ.get("BIND_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "10000")))
+    args = parser.parse_args()
+
+    app = web.Application()
+    for p in ("/", "/healthz", "/health"):
+        app.router.add_route("*", p, http_or_ws)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, args.host, args.port)
+    await site.start()
+    print(f"Relay started on {args.host}:{args.port}")
+    await asyncio.Future()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
