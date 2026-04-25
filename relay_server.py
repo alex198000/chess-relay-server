@@ -169,12 +169,62 @@ async def http_or_ws(request: web.Request) -> web.StreamResponse:
     path = request.path.split("?")[0]
 
     # =========================
-    # METRICS ENDPOINT
+    # DASHBOARD
+    # =========================
+    if path == "/dashboard":
+        return web.Response(text="""
+        <!doctype html>
+        <html>
+        <head>
+            <title>Relay Dashboard</title>
+            <style>
+                body {
+                    background: #0f0f0f;
+                    color: #00ff88;
+                    font-family: monospace;
+                    padding: 20px;
+                }
+                h1 { color: white; }
+                .card {
+                    background: #1e1e1e;
+                    padding: 12px;
+                    margin: 8px 0;
+                    border-radius: 6px;
+                }
+            </style>
+        </head>
+        <body>
+            <h1>Live Relay Dashboard</h1>
+            <div id="m">Loading...</div>
+
+            <script>
+                async function load(){
+                    const r = await fetch('/metrics');
+                    const j = await r.json();
+
+                    document.getElementById('m').innerHTML = `
+                        <div class="card">Total connections: ${j.total_connections}</div>
+                        <div class="card">Active connections: ${j.active_connections}</div>
+                        <div class="card">Messages relayed: ${j.messages_relayed}</div>
+                        <div class="card">Rooms created: ${j.rooms_created}</div>
+                        <div class="card">Disconnects: ${j.disconnects}</div>
+                    `;
+                }
+
+                load();
+                setInterval(load, 1000);
+            </script>
+        </body>
+        </html>
+        """, content_type="text/html")
+
+    # =========================
+    # METRICS JSON
     # =========================
     if path == "/metrics":
         return web.json_response(metrics)
 
-    if path not in ("/", "/healthz", "/health", "/metrics"):
+    if path not in ("/", "/healthz", "/health", "/metrics", "/dashboard"):
         raise web.HTTPNotFound()
 
     if request.headers.get("Upgrade", "").lower() != "websocket":
@@ -197,7 +247,7 @@ async def main() -> None:
     args = parser.parse_args()
 
     app = web.Application()
-    for p in ("/", "/healthz", "/health", "/metrics"):
+    for p in ("/", "/healthz", "/health", "/metrics", "/dashboard"):
         app.router.add_route("*", p, http_or_ws)
 
     runner = web.AppRunner(app)
